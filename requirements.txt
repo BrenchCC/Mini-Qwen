@@ -1,4 +1,3 @@
-torch
 safetensors==0.5.3
 wandb==0.21.1
 tokenizers>=0.22,<0.24
@@ -11,5 +10,10 @@ rich==14.0.0
 questionary==2.0.1
 lightning==2.5.3
 transformers @ git+https://github.com/huggingface/transformers.git
-torchvision
 pytest
+
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch
+torchvision
+
+numpy==1.26.4
