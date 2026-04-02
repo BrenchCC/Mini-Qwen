@@ -11,78 +11,82 @@ logger = logging.getLogger("Vision-Module")
 
 @dataclass
 class VisionConfig:
-    """视觉编码器的配置参数（给小白看的版本）。
+    """视觉编码器配置。
 
-    你可以把它理解成：把一张图/一段视频送进视觉编码器之前，需要先把模型结构和切 patch 的规则说清楚。
+    主要描述两件事：
+    1) 模型结构：Transformer 的层数/头数/隐藏维度等。
+    2) Patch 规则：时间维与空间维如何切 patch，以及后续如何做空间合并。
 
-    关键维度符号（后面注释会反复用到）：
+    维度符号约定（本文件注释统一使用）：
     - B: batch 大小
-    - C: 输入通道数（RGB 通常是 3）
-    - T: 时间维（视频帧数；纯图片也可以当作 T=1）
-    - H/W: 图像高/宽
-    - T'/H'/W': 切 patch 后的网格大小
-    - D: token 的 embedding 维度（n_embedding）
+    - C: 输入通道数（RGB 通常为 3）
+    - T: 时间维（视频帧数；静态图片可视作 T=1）
+    - H/W: 输入图像高/宽
+    - T'/H'/W': 经过 patch 切分后的网格尺寸
+    - D: token embedding 维度（即 `n_embedding`）
     """
-    n_embedding: int
-    n_layer: int
-    n_heads: int
-    n_output_embed: int
-    n_mlp_dim: int
-    num_position_embeddings: int
 
-    input_channels: int = 3
-    temporal_patch_size: int = 2
-    patch_size: int = 16
-    spatial_merge_size: int = 2
+    n_embedding: int  # D，视觉 token 的 embedding 维度
+    n_layer: int  # Transformer block 层数
+    n_heads: int  # Attention 头数（需整除 n_embedding）
+    n_output_embed: int  # PatchMerger 输出维度（供下游语言模型/融合模块使用）
+    n_mlp_dim: int  # MLP 中间层维度
+    num_position_embeddings: int  # 可学习 2D 位置表大小（要求为完全平方数）
+
+    input_channels: int = 3  # 输入像素通道数（RGB=3）
+    temporal_patch_size: int = 2  # 时间维 patch 大小：一次合并多少帧
+    patch_size: int = 16  # 空间维 patch 大小：一次合并多少像素（H/W）
+    spatial_merge_size: int = 2  # 空间合并因子 m：后续将 (m*m) 个 patch 合并为 1 个 token
 
 class VisionRotaryEmbedding(nn.Module):
-    """Vision Rotary Embedding"""
+    """视觉侧 RoPE（Rotary Position Embedding）频率表生成器。
+
+    这里不直接生成“位置向量”，而是生成每个位置对应的角频率表（frequency）。
+    后续在 attention 中通过 `cos/sin` 将 q/k 做旋转，从而注入位置信息。
+    """
     def __init__(
         self,
         dim: int,
         theta: float = 10000.0
     ) -> None:
         super().__init__()
-        # dim：这里表示要生成 RoPE 频率表的“半维度”
-        # 例如 attention 的 head_dim=128 时：
-        # - 2D RoPE 通常先按 h/w 两个轴分别生成 head_dim/4 的频率
-        # - 拼起来变成 head_dim/2（对应 frequency 的最后一维）
-        #
-        # theta：RoPE 的基底常数，越大表示不同维度的频率跨度越大（经典值 10000）
-        inverse_frequency = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype = torch.float) / dim))
+        inverse_frequency = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype = torch.float) / dim))  # RoPE 逆频率表（长度约为 dim/2）
+        # 将逆频率表缓存为 buffer（不参与训练，随 device 迁移）
         self.register_buffer("inverse_frequency", inverse_frequency, persistent = False)
 
-    def forward(self, seq_len: int) -> torch.Tensor:    
-        """生成 RoPE 的角频率表（frequency table）。
+    def forward(self, seq_len: int) -> torch.Tensor:
+        """生成 RoPE 角频率表（frequency）。
 
-        说明（给小白看的）：
-        - RoPE 不是直接存「位置 embedding 向量」，而是为每个位置生成一组旋转角度。
-        - 这里返回的是 `frequency`，后面会在 attention 里做 `cos/sin` 并旋转 q/k。
+        参数
+        - seq_len: 序列长度 L。
 
-        维度：
-        - 输入：`seq_len`（序列长度 L）
-        - 输出：`frequency` 形状为 `(L, dim/2)`
-          其中 `dim` 是 head_dim 或 head_dim/2（取决于你怎么设计 RoPE）。
+        返回
+        - frequency: `(L, dim/2)`，供后续计算 `cos/sin` 并对 q/k 做旋转。
+
+        备注
+        - 这里的 `dim` 通常对应 `head_dim/2`（2D RoPE 会在 h/w 两个轴各生成一段频率后拼接）。
         """
-        sequence = torch.arange(seq_len, dtype = self.inverse_frequency.dtype, device = self.inverse_frequency.device)
-        frequency = sequence[:, None] * self.inverse_frequency[None, :]
+        sequence = torch.arange(seq_len, dtype = self.inverse_frequency.dtype, device = self.inverse_frequency.device)  # (L,)
+        frequency = sequence[:, None] * self.inverse_frequency[None, :]  # (L, dim/2)
 
         return frequency
     
 
 class VisionPatchEmbedding(nn.Module):
-    """Vision Patch Embedding"""
+    """将像素切 patch 并投影为视觉 token。
+
+    采用 `Conv3d` 同时处理时间维与空间维：
+    - 时间维 kernel/stride 为 `temporal_patch_size`
+    - 空间维 kernel/stride 为 `patch_size`
+    """
     def __init__(
         self,
         config: VisionConfig
     ) -> None:
         super().__init__()
         self.config = config
-        # 3D 卷积的 kernel/stride：
-        # - temporal_patch_size：沿时间维一次吃多少帧（类似视频 patch）
-        # - patch_size：沿空间 H/W 一次吃多少像素（类似 ViT 的 patch）
-        self.kernel_size = [self.config.temporal_patch_size, self.config.patch_size, self.config.patch_size]
-        self.stride = [self.config.temporal_patch_size, self.config.patch_size, self.config.patch_size]
+        self.kernel_size = [self.config.temporal_patch_size, self.config.patch_size, self.config.patch_size]  # Conv3d kernel: (T_patch, H_patch, W_patch)
+        self.stride = [self.config.temporal_patch_size, self.config.patch_size, self.config.patch_size]  # Conv3d stride: 与 kernel 相同以实现不重叠切 patch
        
         self.projection = nn.Conv3d(
             in_channels = self.config.input_channels,
@@ -93,40 +97,27 @@ class VisionPatchEmbedding(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Project pixels to patch embeddings.
+        """把像素张量转换为 patch token，并按 merge 规则重排。
 
-        Parameters
-        ----------
-        x: torch.Tensor
-            Pixel tensor in shape (batch, channels, time, height, width).
+        参数
+        - x: `(B, C, T, H, W)` 的像素张量。
 
-        Returns
-        -------
-        torch.Tensor
-            Packed patch embeddings in shape (total_patches, dim). The patch order is
-            re-arranged to make each `spatial_merge_size x spatial_merge_size` group
-            contiguous, matching the downstream `PatchMerger` expectation.
+        返回
+        - packed_tokens: `(total_tokens, D)` 的 token 序列，其中 token 顺序已重排，保证每个
+          `spatial_merge_size x spatial_merge_size` 空间小块对应的 patch 在内存中连续，便于下游 `PatchMerger` 合并。
         """
-        # 期望输入是 5D：
-        # x: (B, C, T, H, W)
-        # B=batch，C=通道数，T=时间维（视频/帧数），H/W=图像高宽
+        # 关键约束：视觉输入必须是 5D `(B, C, T, H, W)`
         if x.ndim != 5:
             raise ValueError(f"Expected pixels in (B, C, T, H, W), got shape = {tuple(x.shape)}")
 
-        # 1) 用 Conv3d 把像素切成 patch，并投影到 embedding 维度
-        # projection 输出： (B, D, T', H', W')
-        # 其中：
-        # - D = n_embedding
-        # - T' = T / temporal_patch_size
-        # - H' = H / patch_size
-        # - W' = W / patch_size
+        # 1) Conv3d：切 patch + 投影到 embedding 维度
+        # 输出形状为 `(B, D, T', H', W')`
         x = self.projection(x)
-        # 2) 把通道维挪到最后，方便后续 reshape/merge
-        # (B, D, T', H', W') -> (B, T', H', W', D)
+        # 2) 调整维度顺序：把 embedding 维移到最后，便于后续 reshape/merge
         x = x.permute(0, 2, 3, 4, 1).contiguous()
 
-        batch_size, t_grid, h_grid, w_grid, dim = x.shape
-        merge_size = int(self.config.spatial_merge_size)
+        batch_size, t_grid, h_grid, w_grid, dim = x.shape  # (B, T', H', W', D)
+        merge_size = int(self.config.spatial_merge_size)  # m：每个空间小块边长（m*m 个 patch 合并）
         if (h_grid % merge_size) != 0 or (w_grid % merge_size) != 0:
             raise ValueError(
                 f"Patch grid (H'={h_grid}, W'={w_grid}) must be divisible by spatial_merge_size={merge_size}"
@@ -157,7 +148,11 @@ class VisionPatchEmbedding(nn.Module):
         return x
 
 class PatchMerger(nn.Module):
-    """Patch Merger"""
+    """空间 patch 合并器。
+
+    将 `spatial_merge_size x spatial_merge_size` 的空间小块内的 patch token 拼接起来，
+    通过 MLP 投影为一个更粗粒度的 token，降低序列长度。
+    """
     def __init__(
         self,
         config: VisionConfig,
@@ -166,11 +161,9 @@ class PatchMerger(nn.Module):
         super().__init__()
         self.config = config
 
-        # Merge spatial_merge_size x spatial_merge_size patches in spatial dimensions.
-        # hidden_size = D * (m*m)
-        # 因为我们要把一个 m×m 的空间小块里的 patch token 拼接到一起当作一个更大的 token。
-        self.hidden_size = config.n_embedding * (config.spatial_merge_size ** 2)
+        self.hidden_size = config.n_embedding * (config.spatial_merge_size ** 2)  # hidden_size = D * (m*m)，拼接一个空间小块内的 patch token
         self.use_post_shuffle_norm = use_post_shuffle_norm
+        # 可选：在合并后的向量上做 LayerNorm（常用于 token shuffle/重排之后稳定分布）
         self.norm = nn.LayerNorm(
             self.hidden_size if use_post_shuffle_norm else config.n_embedding, 
             eps = 1e-6,
@@ -181,6 +174,12 @@ class PatchMerger(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """把多个空间 patch 合并成一个 token，并投影到输出维度。
+
+        参数
+        - x: 通常为 `(num_groups, m*m*D)`。
+
+        返回
+        - out: `(num_groups, n_output_embed)`。
 
         这里的输入 x 通常是把一个 (m x m) 的空间小块 flatten 后的向量。
 
@@ -202,24 +201,22 @@ class PatchMerger(nn.Module):
         return x
 
 class VisionAttention(nn.Module):    
+    """视觉侧自注意力（支持 2D RoPE 与 block-diagonal mask）。"""
     def __init__(
         self,
         config: VisionConfig    
     ) -> None:
         super().__init__()
-        # 线性层一次性生成 q/k/v（省一次 matmul）
-        self.qkv = nn.Linear(config.n_embedding, 3 * config.n_embedding, bias = True)
-        self.n_heads = config.n_heads
-        self.head_dim = config.n_embedding // config.n_heads
-        # Must project back to n_embedding for residual add.
+        self.qkv = nn.Linear(config.n_embedding, 3 * config.n_embedding, bias = True)  # 一次性生成 q/k/v，减少一次线性层调用
+        self.n_heads = config.n_heads  # 注意力头数 H
+        self.head_dim = config.n_embedding // config.n_heads  # 每个头的维度 d
+        # residual 需要回到 D 维，以便与输入相加
         self.projection = nn.Linear(config.n_embedding, config.n_embedding, bias = True)
 
     @staticmethod
     def _rotary_half(x: torch.Tensor) -> torch.Tensor:
-        """Rotary Half"""
-        # 把最后一维拆成两半 (x1, x2)，并返回 (-x2, x1)。
-        # 这是实现 2D 旋转的一个常用小技巧：rotate_half(x)。
-        half = x.shape[-1] // 2
+        """RoPE 辅助函数：对最后一维做 (x1, x2) -> (-x2, x1) 变换。"""
+        half = x.shape[-1] // 2  # head_dim 的一半
         x1 = x[..., :half]
         x2 = x[..., half:]
 
@@ -243,7 +240,7 @@ class VisionAttention(nn.Module):
 
         # x: (seq_len, n_heads, head_dim)
         # frequency: (seq_len, head_dim / 2)
-        original_type = x.dtype
+        original_type = x.dtype  # 计算 cos/sin 时先转 float32，最后再转回原 dtype
         x = x.float()
 
         cos = torch.cos(frequency).float()
@@ -258,7 +255,7 @@ class VisionAttention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        cu_seqlens: torch.Tensor = None, # A special index tensor (cu_seqlens) is used to keep track of the boundary positions of the individual original sequences
+        cu_seqlens: torch.Tensor = None,
         rotary_pos_emb: torch.Tensor = None
     ) -> torch.Tensor:
         """自注意力（仅做同一张图/同一段序列内部的 attention）。
@@ -267,12 +264,14 @@ class VisionAttention(nn.Module):
         - 输入 x: `(L, D)`，L 是打包后的 token 总数，D=n_embedding
         - 输出: `(L, D)`，方便 residual 相加
 
-        注意：
-        - 这里用 `cu_seqlens` 生成 block-diagonal mask，让不同样本/不同帧之间互不 attention。
+        参数
+        - x: `(L, D)` 打包后的 token 序列。
+        - cu_seqlens: 可选的边界索引（前缀和形式），用于构造 block-diagonal mask，
+          让不同样本/不同帧之间互不 attention。
+        - rotary_pos_emb: 可选的 RoPE 频率表 `(L, head_dim/2)`，用于旋转 q/k。
         """
-        seq_len = x.shape[0]
-        # 线性层一次性算出 q/k/v
-        # (L, D) -> (L, 3*D) -> (L, 3, n_heads, head_dim)
+        seq_len = x.shape[0]  # L，总 token 数
+        # 线性层一次性算出 q/k/v，并 reshape 为按头拆分的形状
         q, k, v = (
             self.qkv(x)
             .reshape(seq_len, 3, self.n_heads, self.head_dim)
@@ -280,12 +279,11 @@ class VisionAttention(nn.Module):
             .unbind(0)
         )
 
-        # 对 q/k 应用 RoPE（v 一般不需要旋转）
+        # 关键操作：对 q/k 应用 RoPE（v 一般不需要旋转）
         q = self._apply_rotary_position_embedding_vision(q, rotary_pos_emb)
         k = self._apply_rotary_position_embedding_vision(k, rotary_pos_emb)
 
-        # (seq, heads, dim) -> (heads, seq, dim)
-        # 下面这样做的原因：matmul 计算 attention 时通常按 (H, L, d) 来写更直观。
+        # 关键操作：转置到 `(H, L, d)`，便于后续计算 QK^T 与加权求和
         q = q.transpose(0, 1)
         k = k.transpose(0, 1)
         v = v.transpose(0, 1)
@@ -323,7 +321,7 @@ class VisionAttention(nn.Module):
         return self.projection(attn_output)
 
 class VisionMLP(nn.Module):
-    """Vision MLP"""
+    """视觉侧两层前馈网络（MLP）。"""
     def __init__(self, config: VisionConfig) -> None:
         super().__init__()
         self.linear_1 = nn.Linear(config.n_embedding, config.n_mlp_dim, bias = True)
@@ -332,6 +330,12 @@ class VisionMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """两层前馈网络（MLP）。
+
+        参数
+        - x: `(L, D)` 的 token 序列。
+
+        返回
+        - out: `(L, D)`。
 
         维度：
         - 输入 x: `(L, D)`
@@ -344,7 +348,7 @@ class VisionMLP(nn.Module):
         return x
 
 class VisionBlock(nn.Module):
-    """Vision Block"""
+    """视觉侧 Transformer Block（Pre-Norm Attention + Pre-Norm MLP）。"""
     def __init__(self, config: VisionConfig) -> None:
         super().__init__()
         self.attention = VisionAttention(config)
@@ -356,8 +360,13 @@ class VisionBlock(nn.Module):
     def forward(self, x, cu_seqlens = None, rotary_pos_emb = None) -> torch.Tensor:
         """一个标准 Transformer block（Attention + MLP）。
 
-        维度：
-        - 输入/输出 x: `(L, D)`
+        参数
+        - x: `(L, D)` 的 token 序列。
+        - cu_seqlens: 可选边界索引（前缀和），用于 attention 的 block-diagonal mask。
+        - rotary_pos_emb: 可选 RoPE 频率表 `(L, head_dim/2)`。
+
+        返回
+        - out: `(L, D)`。
         """
         x = x + self.attention(
             self.norm_1(x), 
@@ -371,36 +380,32 @@ class VisionBlock(nn.Module):
 
 
 class VisionEncoder(nn.Module):
-    """Vision Encoder"""
+    """视觉编码器：patch embedding + position embedding + Transformer + patch merge。"""
     def __init__(self, config: VisionConfig) -> None:
         super().__init__()
         self.config = config
-        self.patch_embedding = VisionPatchEmbedding(config)
+        self.patch_embedding = VisionPatchEmbedding(config)  # 像素 -> patch token（并按 merge 规则重排）
         # Reference-compatible alias
         self.patch_embed = self.patch_embedding
 
-        # Learnable position embeddings
-        # 这里的 position_embeddings 是“基础网格”的可学习参数：
-        # - 形状：(num_position_embeddings, D)
-        # - 通常假设它对应一个 sqrt(N) × sqrt(N) 的二维网格
-        # - 输入图片/视频的 patch 网格尺寸不一定等于这个基础网格，所以需要插值
-        self.position_embeddings = nn.Embedding(config.num_position_embeddings, config.n_embedding)
+        self.position_embeddings = nn.Embedding(config.num_position_embeddings, config.n_embedding)  # 可学习 2D 基础网格（后续会插值到当前 patch 网格）
         # Reference-compatible alias
         self.pos_embed = self.position_embeddings
-        self.num_grid_per_side = int(config.num_position_embeddings ** 0.5)
+        self.num_grid_per_side = int(config.num_position_embeddings ** 0.5)  # 基础网格边长 sqrt(num_position_embeddings)
         if (self.num_grid_per_side * self.num_grid_per_side) != int(config.num_position_embeddings):
             raise ValueError(
                 "num_position_embeddings must be a perfect square for 2D grid interpolation, "
                 f"got num_position_embeddings={config.num_position_embeddings}"
             )
 
+        # Transformer blocks
         self.blocks = nn.ModuleList(
             [VisionBlock(config) for _ in range(config.n_layer)]
         )
 
-        self.merger = PatchMerger(config = config, use_post_shuffle_norm = True)
+        self.merger = PatchMerger(config = config, use_post_shuffle_norm = True)  # (m*m) patch token -> 1 个 merged token
 
-        self.head_dim = config.n_embedding // config.n_heads
+        self.head_dim = config.n_embedding // config.n_heads  # 每个头的维度 d
         if (self.head_dim * config.n_heads) != config.n_embedding:
             raise ValueError(
                 "n_embedding must be divisible by n_heads, "
@@ -412,33 +417,26 @@ class VisionEncoder(nn.Module):
                 f"got head_dim={self.head_dim}"
             )
 
-        # For 2D rotary: we generate per-axis frequencies of size head_dim/4, then
-        # concatenate (h, w) => head_dim/2, which matches `_apply_rotary_position_embedding_vision`.
-        self.rotary_position_embedding = VisionRotaryEmbedding(dim = self.head_dim // 2)
+        self.rotary_position_embedding = VisionRotaryEmbedding(dim = self.head_dim // 2)  # 2D RoPE：每个轴生成 head_dim/4，拼接后为 head_dim/2
         # Reference-compatible alias
         self.rotary_pos_emb = self.rotary_position_embedding
 
-        self.spatial_merge_size = config.spatial_merge_size
+        self.spatial_merge_size = config.spatial_merge_size  # m：空间合并因子
 
     def fast_pos_embed_interpolate(self, d_image: torch.Tensor) -> torch.Tensor:
-        """Interpolate learned position embeddings to match patch-grid dimensions.
+        """将可学习的 2D 位置表插值到当前 patch 网格，并按 packed token 顺序输出。
 
-        Parameters
-        ----------
-        d_image: torch.Tensor
-            Patch-grid shape tensor in (batch, 3): (grid_t, grid_h, grid_w).
+        参数
+        - d_image: `(B, 3)`，每行是 `(grid_t, grid_h, grid_w)`。
 
-        Returns
-        -------
-        torch.Tensor
-            Packed position embeddings in shape (total_patches, dim). The ordering is
-            consistent with `VisionPatchEmbedding.forward` (merge-group contiguous).
+        返回
+        - pos_embeds: `(total_tokens, D)`，顺序与 `VisionPatchEmbedding.forward` 的 packed token 顺序一致。
         """
-        grid_ts, grid_hs, grid_ws = d_image[:, 0], d_image[:, 1], d_image[:, 2]
+        grid_ts, grid_hs, grid_ws = d_image[:, 0], d_image[:, 1], d_image[:, 2]  # (B,) 每个样本的 (T', H', W')
         device = d_image.device
 
-        idx_list = [[] for _ in range(4)]
-        weight_list = [[] for _ in range(4)]
+        idx_list = [[] for _ in range(4)]  # 4 个邻居位置索引（双线性插值）
+        weight_list = [[] for _ in range(4)]  # 4 个邻居对应权重
 
         # 目标：对每个样本把 (num_position_embeddings) 这张“基础网格”插值到当前 (h, w) 的 patch 网格。
         # 然后再重复 t 次，并且按照 merge 的顺序 permute 成“打包 token”的顺序。
@@ -483,12 +481,13 @@ class VisionEncoder(nn.Module):
                 idx_list[i].extend(indices[i].tolist())
                 weight_list[i].extend(weights[i].tolist())
 
-        idx_tensor = torch.tensor(idx_list, dtype = torch.long, device = device)
-        weight_tensor = torch.tensor(weight_list, dtype = self.pos_embed.weight.dtype, device = device)
+        idx_tensor = torch.tensor(idx_list, dtype = torch.long, device = device)  # (4, total_hw)
+        weight_tensor = torch.tensor(weight_list, dtype = self.pos_embed.weight.dtype, device = device)  # (4, total_hw)
 
         # pos_embed(idx_tensor): (4, total_hw, D)
         # weight_tensor[:, :, None]: (4, total_hw, 1)
         # 广播相乘后还是 (4, total_hw, D)
+        # 关键操作：按索引取 embedding，并乘上插值权重
         pos_embeds = self.pos_embed(idx_tensor).to(device) * weight_tensor[:, :, None]
         # 4 个邻居加权求和 -> (total_hw, D)
         patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
@@ -497,7 +496,7 @@ class VisionEncoder(nn.Module):
         patch_pos_embeds = patch_pos_embeds.split([int(h.item()) * int(w.item()) for h, w in zip(grid_hs, grid_ws)])
 
         patch_pos_embeds_permute = []
-        merge_size = int(self.config.spatial_merge_size)
+        merge_size = int(self.config.spatial_merge_size)  # m：空间合并因子
         for pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws):
             t = int(t.item())
             h = int(h.item())
@@ -521,23 +520,20 @@ class VisionEncoder(nn.Module):
 
     # Backward-compatible alias
     def fast_position_embedding_interpolate(self, dim_image: torch.Tensor) -> torch.Tensor:
+        """兼容旧接口：等价于 `fast_pos_embed_interpolate`。"""
         return self.fast_pos_embed_interpolate(dim_image)
     
     def rot_pos_emb(self, d_image: torch.Tensor) -> torch.Tensor:
-        """Build 2D rotary position embeddings for packed vision tokens.
+        """为 packed token 构造 2D RoPE 频率表。
 
-        Parameters
-        ----------
-        d_image: torch.Tensor
-            Patch-grid shape tensor in (batch, 3): (grid_t, grid_h, grid_w).
+        参数
+        - d_image: `(B, 3)`，每行是 `(grid_t, grid_h, grid_w)`。
 
-        Returns
-        -------
-        torch.Tensor
-            Rotary frequency tensor in shape (total_patches, head_dim / 2).
+        返回
+        - rotary_pos_emb: `(total_tokens, head_dim/2)`，用于 attention 中旋转 q/k。
         """
         pos_ids = []
-        sms = int(self.spatial_merge_size)
+        sms = int(self.spatial_merge_size)  # m：空间合并因子
 
         # 目标：为每个 token 生成 2D 位置（h_id, w_id），再查表得到对应的 RoPE 频率。
         # 注意这里的位置顺序同样要匹配 merge 后的 token 顺序。
@@ -573,6 +569,7 @@ class VisionEncoder(nn.Module):
 
     # Backward-compatible alias
     def rotate_position_embedding(self, dim_image: torch.Tensor) -> torch.Tensor:
+        """兼容旧接口：保留原实现（注意该接口不等价于 2D RoPE 构造）。"""
         return self.rotary_position_embedding(int(dim_image))
 
     
@@ -582,27 +579,16 @@ class VisionEncoder(nn.Module):
         d_image: torch.Tensor = None,
         dim_image: torch.Tensor = None,
     ) -> torch.Tensor:
-        """Encode pixels into merged vision embeddings (reference-compatible).
+        """将像素编码为 merged vision embeddings。
 
-        Parameters
-        ----------
-        pixels: torch.Tensor
-            Pixel tensor in shape (batch, channels, time, height, width).
-        d_image: torch.Tensor
-            Patch-grid shape tensor in (batch, 3): (grid_t, grid_h, grid_w).
-        dim_image: torch.Tensor
-            Deprecated alias for `d_image`.
+        参数
+        - pixels: `(B, C, T, H, W)` 像素张量。
+        - d_image: 可选 `(B, 3)` patch 网格信息，每行是 `(grid_t, grid_h, grid_w)`。
+        - dim_image: 兼容旧参数名，等价于 `d_image`。
 
-        Returns
-        -------
-        torch.Tensor
-            Merged vision embeddings in shape (num_groups, output_dim).
+        返回
+        - merged_embeds: `(num_groups, n_output_embed)`，其中 `num_groups = total_tokens / (m*m)`。
         """
-        # d_image 形状：(B, 3)
-        # 每行：(grid_t, grid_h, grid_w)
-        # - grid_t = T'
-        # - grid_h = H'
-        # - grid_w = W'
         if d_image is None:
             d_image = dim_image
         if d_image is None:
@@ -622,7 +608,7 @@ class VisionEncoder(nn.Module):
         # total_tokens = sum_i (grid_t * grid_h * grid_w)
         hidden_states = self.patch_embed(pixels)
 
-        expected_tokens = int((d_image[:, 0] * d_image[:, 1] * d_image[:, 2]).sum().item())
+        expected_tokens = int((d_image[:, 0] * d_image[:, 1] * d_image[:, 2]).sum().item())  # total_tokens = sum_i(T'_i*H'_i*W'_i)
         if hidden_states.shape[0] != expected_tokens:
             raise ValueError(
                 "Packed token count mismatch: "
@@ -659,3 +645,87 @@ class VisionEncoder(nn.Module):
         # 输出： (num_groups, n_output_embed)
         # num_groups = total_tokens / (m*m)
         return self.merger(hidden_states)
+
+
+def _smoke_test() -> None:
+    """最小可运行的 smoke test。
+
+    目标：
+    - 覆盖 `VisionEncoder.forward` 的两种用法：显式传 `d_image` / 让模型自动推断。
+    - 校验输出形状与关键中间张量形状。
+    """
+    torch.manual_seed(0)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # 优先使用 GPU（如果可用），否则使用 CPU
+    dtype = torch.float32  # 测试用 dtype：保持 float32 便于排查数值问题
+
+    config = VisionConfig(
+        n_embedding = 32,
+        n_layer = 2,
+        n_heads = 4,
+        n_output_embed = 64,
+        n_mlp_dim = 64,
+        num_position_embeddings = 16,
+        input_channels = 3,
+        temporal_patch_size = 2,
+        patch_size = 16,
+        spatial_merge_size = 2,
+    )
+
+    encoder = VisionEncoder(config).to(device)  # 实例化视觉编码器
+    encoder.eval()
+
+    batch_size = 2  # B：batch 大小
+    channels = config.input_channels  # C：输入通道数
+    t = 2  # T：帧数（时间维）；需能被 temporal_patch_size 整除
+    h = 32  # H：输入图像高度；需能被 patch_size 整除
+    w = 32  # W：输入图像宽度；需能被 patch_size 整除
+
+    pixels = torch.randn(batch_size, channels, t, h, w, device = device, dtype = dtype)  # (B, C, T, H, W)
+
+    # 关键操作：显式提供 patch 网格信息
+    # - T' = T / temporal_patch_size
+    # - H' = H / patch_size
+    # - W' = W / patch_size
+    d_image = torch.tensor(
+        [[t // config.temporal_patch_size, h // config.patch_size, w // config.patch_size]] * batch_size,
+        device = device,
+        dtype = torch.long,
+    )
+
+    with torch.no_grad():
+        # 关键操作：分别测试显式传参与自动推断，二者结果形状应一致
+        out_explicit = encoder(pixels, d_image = d_image)
+        out_infer = encoder(pixels, d_image = None)
+
+        # 关键形状检查：用 d_image 计算 packed token 总数
+        expected_tokens = int((d_image[:, 0] * d_image[:, 1] * d_image[:, 2]).sum().item())  # sum_i(T'_i*H'_i*W'_i)
+        pos = encoder.fast_pos_embed_interpolate(d_image)  # (total_tokens, D)
+        rope = encoder.rot_pos_emb(d_image)  # (total_tokens, head_dim/2)
+
+    # 断言 1：位置 embedding 的 token 数与维度一致
+    assert pos.shape == (expected_tokens, config.n_embedding), f"pos shape mismatch: {tuple(pos.shape)}"
+    # 断言 2：RoPE 频率表的 token 数与维度一致
+    assert rope.shape[0] == expected_tokens, f"rope token count mismatch: {tuple(rope.shape)}"
+    assert rope.shape[1] == (encoder.head_dim // 2), f"rope dim mismatch: {tuple(rope.shape)}"
+    # 断言 3：显式 d_image 与自动推断输出形状一致
+    assert out_explicit.shape == out_infer.shape, f"explicit/infer output mismatch: {tuple(out_explicit.shape)} vs {tuple(out_infer.shape)}"
+    # 断言 4：输出维度为 n_output_embed
+    assert out_explicit.shape[-1] == config.n_output_embed, f"output dim mismatch: {tuple(out_explicit.shape)}"
+    # 断言 5：输出数值有限（无 NaN/Inf）
+    assert torch.isfinite(out_explicit).all().item(), "output contains NaN/Inf"
+
+    logger.info("Smoke test passed")
+    logger.info("device=%s dtype=%s", device, dtype)
+    logger.info("pixels=%s", tuple(pixels.shape))
+    logger.info("d_image=%s", tuple(d_image.shape))
+    logger.info("pos=%s rope=%s out=%s", tuple(pos.shape), tuple(rope.shape), tuple(out_explicit.shape))
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level = logging.INFO,
+        format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        handlers = [logging.StreamHandler()],
+    )
+    _smoke_test()
